@@ -1,3 +1,9 @@
+/*
+ * main.c
+ * Numeric Comparison bonding (phone shows code + user confirms), peripheral auto-accepts.
+ * Keeps your SW0/SW1/SW2 advertising controls + RPA toggle.
+ */
+
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
@@ -64,6 +70,9 @@ static bool adv_is_running;
  */
 static bool use_rotating_rpa = true;
 
+/* Work item to request MITM security right after connect (forces phone UI) */
+static struct k_work_delayable security_work;
+
 static void addr_to_str(const bt_addr_le_t *addr, char *out, size_t out_len)
 {
 	if (!addr || !out || out_len == 0) {
@@ -79,13 +88,12 @@ static void leds_all_off(void)
 	}
 }
 
-/* LED0: advertising, LED1: connected, LED2: RPA mode, LED3: passkey indicator */
+/* LED0: advertising, LED1: connected, LED2: RPA mode, LED3: pairing indicator */
 static void leds_update(void)
 {
 	gpio_pin_set_dt(&leds[0], adv_is_running ? 1 : 0);
 	gpio_pin_set_dt(&leds[1], current_conn ? 1 : 0);
 	gpio_pin_set_dt(&leds[2], use_rotating_rpa ? 1 : 0);
-	/* LED3 controlled by passkey / auth callbacks */
 }
 
 /* ---- Button ISRs ---- */
@@ -168,6 +176,24 @@ static int adv_start(bool rotating_rpa)
 	return 0;
 }
 
+/* ---- Security request work ---- */
+static void security_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!current_conn) {
+		return;
+	}
+
+	/* Request MITM (L3) after connect to trigger Numeric Comparison UI on phone */
+	int err = bt_conn_set_security(current_conn, BT_SECURITY_L3);
+	if (err) {
+		LOG_WRN("bt_conn_set_security(L3) failed: %d", err);
+	} else {
+		LOG_INF("Requested security level L3 (MITM)");
+	}
+}
+
 /* ---- Connection callbacks ---- */
 static void connected(struct bt_conn *conn, uint8_t err)
 {
@@ -186,6 +212,9 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	/* For connectable advertising, controller stops advertising when connected */
 	adv_is_running = false;
 	leds_update();
+
+	/* Kick off pairing/security a moment after connect */
+	k_work_schedule(&security_work, K_MSEC(200));
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -195,12 +224,14 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	addr_to_str(bt_conn_get_dst(conn), peer, sizeof(peer));
 	LOG_INF("Disconnected: %s (reason %u)", peer, reason);
 
+	k_work_cancel_delayable(&security_work);
+
 	if (current_conn) {
 		bt_conn_unref(current_conn);
 		current_conn = NULL;
 	}
 
-	gpio_pin_set_dt(&leds[3], 0); /* Clear passkey indicator */
+	gpio_pin_set_dt(&leds[3], 0); /* Clear pairing indicator */
 	leds_update();
 
 	if (want_advertising) {
@@ -216,7 +247,6 @@ static void security_changed(struct bt_conn *conn,
 	char peer[BT_ADDR_LE_STR_LEN] = {0};
 	addr_to_str(bt_conn_get_dst(conn), peer, sizeof(peer));
 
-	/* level: L1..L4, err: 0 == success */
 	LOG_INF("Security changed: %s level=%u err=%u", peer, level, err);
 }
 
@@ -226,65 +256,56 @@ static struct bt_conn_cb conn_callbacks = {
 	.security_changed = security_changed,
 };
 
-/* ---- Pairing/Bonding ----
- * Key change: implement passkey_display to allow MITM-capable pairing.
- * Android will show a passkey entry UI; you enter the printed passkey on the phone.
+/* ---- Pairing/Bonding: Numeric Comparison ----
+ * Goal: phone shows 6-digit code and user confirms on phone/app.
+ * Peripheral auto-accepts the numeric comparison request.
+ *
+ * Note: Numeric comparison is delivered via passkey_confirm().
+ * We keep passkey_display but we don't need to print the number.
  */
 
 static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
 {
-	char peer[BT_ADDR_LE_STR_LEN] = {0};
-	addr_to_str(bt_conn_get_dst(conn), peer, sizeof(peer));
-
-	/* This is the critical line for debugging + user entry on Android */
-	LOG_INF("Passkey for %s: %06u", peer, passkey);
-
-	/* Visual indicator: LED3 on while passkey is relevant */
-	gpio_pin_set_dt(&leds[3], 1);
+	ARG_UNUSED(conn);
+	ARG_UNUSED(passkey);
+	/* Intentionally not logging the passkey (you said you don't need it) */
 }
 
-/* For some methods, Zephyr will ask you to confirm “Just Works” / numeric comparison.
- * We keep pairing_confirm to allow “Just Works” when MITM isn't required.
- */
-static void pairing_confirm(struct bt_conn *conn)
+static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
 {
-	char peer[BT_ADDR_LE_STR_LEN] = {0};
-	addr_to_str(bt_conn_get_dst(conn), peer, sizeof(peer));
+	ARG_UNUSED(passkey);
 
-	LOG_INF("Pairing confirm for %s -> accepting", peer);
-	bt_conn_auth_pairing_confirm(conn);
+	/* Indicate pairing in progress */
+	gpio_pin_set_dt(&leds[3], 1);
+
+	LOG_INF("Numeric comparison requested -> auto-accepting on peripheral");
+	bt_conn_auth_passkey_confirm(conn);
 }
 
 static void auth_cancel(struct bt_conn *conn)
 {
-	char peer[BT_ADDR_LE_STR_LEN] = {0};
-	addr_to_str(bt_conn_get_dst(conn), peer, sizeof(peer));
-
-	LOG_WRN("Pairing cancelled: %s", peer);
+	ARG_UNUSED(conn);
+	LOG_WRN("Pairing cancelled");
 	gpio_pin_set_dt(&leds[3], 0);
 }
 
 static void pairing_complete(struct bt_conn *conn, bool bonded)
 {
-	char peer[BT_ADDR_LE_STR_LEN] = {0};
-	addr_to_str(bt_conn_get_dst(conn), peer, sizeof(peer));
-
-	LOG_INF("Pairing complete: %s (bonded=%d)", peer, bonded);
+	ARG_UNUSED(conn);
+	LOG_INF("Pairing complete (bonded=%d)", bonded);
 	gpio_pin_set_dt(&leds[3], 0);
 }
 
 static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
 {
-	char peer[BT_ADDR_LE_STR_LEN] = {0};
-	addr_to_str(bt_conn_get_dst(conn), peer, sizeof(peer));
-
-	LOG_ERR("Pairing failed: %s (reason %d)", peer, reason);
+	ARG_UNUSED(conn);
+	LOG_ERR("Pairing failed (reason %d)", reason);
 	gpio_pin_set_dt(&leds[3], 0);
 }
 
 static struct bt_conn_auth_cb auth_cb = {
 	.passkey_display = auth_passkey_display,
-	.pairing_confirm = pairing_confirm,
+	.passkey_confirm = auth_passkey_confirm,
 	.cancel = auth_cancel,
 };
 
@@ -343,7 +364,7 @@ int main(void)
 
 	LOG_INF("Booting...");
 	LOG_INF("=== FW: SW0=start adv, SW1=stop/disconnect, SW2=toggle RPA ===");
-	LOG_INF("=== Pairing: if Android requests MITM, enter passkey printed in logs ===");
+	LOG_INF("=== Pairing: Numeric Comparison (confirm on phone). Peripheral auto-accepts. ===");
 
 	err = init_leds();
 	if (err) {
@@ -357,6 +378,9 @@ int main(void)
 
 	leds_all_off();
 	leds_update();
+
+	/* Init security work */
+	k_work_init_delayable(&security_work, security_work_fn);
 
 	err = bt_enable(NULL);
 	if (err) {
